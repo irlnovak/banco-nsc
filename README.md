@@ -6,6 +6,25 @@
 
 ---
 
+## 🛠 ATENÇÃO — Correção do banco de dados (setup.sql v3)
+
+Se você executou uma versão anterior do `supabase/setup.sql`, **rode a nova versão** para reparar o projeto. A versão antiga tinha **dois bugs que impediam qualquer cadastro**:
+
+1. **Erro 500 no cadastro** ("Database error saving new user"): o gatilho `handle_new_user` usava o operador `- 'null'::jsonb`, que **não existe no Postgres**. Todo `signUp` era cancelado pelo Supabase Auth.
+2. **Funções criadas antes das tabelas**: `is_admin()` referenciava `public.profiles` antes de ela existir, quebrando as políticas RLS em cascata em bancos novos.
+
+A v3 também corrige o gatilho `protect_profile`, que bloqueava as próprias funções financeiras (Pix, dízimo, salário) de atualizarem o saldo.
+
+**Como reparar (2 minutos):**
+
+1. Abra o **Supabase Dashboard** → **SQL Editor** → *New query*;
+2. Cole **todo** o conteúdo de [`supabase/setup.sql`](./supabase/setup.sql) e clique em **Run** (a v3 é idempotente — pode rodar sobre a antiga sem problemas);
+3. Volte ao app e crie a conta normalmente. O perfil nasce com **R$ 1.620,00** e chaves Pix automáticas (e-mail e telefone do cadastro);
+4. Para virar administrador, no SQL Editor: `update public.profiles set role = 'admin' where username = 'SEU_USERNAME';`
+
+> A chave `anon` do Supabase é pública por design — quem protege os dados é o **Row Level Security**. Senhas reais ficam com hash no Supabase Auth, nunca no frontend.
+
+
 ## 📋 Descrição
 
 O **Banco Nossa Senhora da Conceição** permite que membros da paróquia virtual criem uma conta, acompanhem seu saldo e movimentações, enviem **Pix virtual**, paguem **boletos fictícios**, contribuam com o **dízimo**, quitem **taxas e impostos do bairro** e gerem **comprovantes** — tudo em uma interface inspirada em bancos modernos, com identidade visual azul `#0055A6` e branco.

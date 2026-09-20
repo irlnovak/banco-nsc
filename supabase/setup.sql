@@ -1,42 +1,30 @@
 -- ============================================================================
--- BANCO NOSSA SENHORA DA CONCEIÇÃO — SETUP COMPLETO DO SUPABASE (v2)
--- Banco de dados REAL: cadastro e login passam a usar auth.users (Supabase
--- Auth) + tabelas públicas com Row Level Security.
+-- BANCO NOSSA SENHORA DA CONCEIÇÃO — SETUP COMPLETO DO SUPABASE (v3 — CORRIGIDO)
 --
--- COMO USAR: Dashboard do Supabase → ícone SQL (SQL Editor) → New query →
--- cole TODO este arquivo → Run.
+-- CORREÇÕES DESTA VERSÃO (em relação à v2):
+--   1. ORDEM CORRIGIDA: tabelas são criadas ANTES das funções que as
+--      referenciam (na v2, is_admin() quebrava em banco limpo e derrubava
+--      as policies em cascata).
+--   2. BUG FATAL DO CADASTRO CORRIGIDO: o gatilho handle_new_user usava
+--      o operador "- 'null'::jsonb", que NÃO EXISTE no Postgres
+--      ("operator does not exist: jsonb - jsonb") — isso causava
+--      HTTP 500 "Database error saving new user" em TODOS os cadastros.
+--      Agora o array de chaves Pix é montado com jsonb || jsonb (suportado).
+--   3. GATILHO À PROVA DE FALHAS: usuários anônimos (sem username) são
+--      ignorados sem erro, e duplicidades não derrubam o cadastro.
+--   4. IDEMPOTENTE: pode rodar quantas vezes quiser (drop if exists +
+--      create or replace em tudo) — serve para REPARAR um projeto que
+--      já rodou a versão quebrada.
+--
+-- COMO USAR: Dashboard do Supabase → SQL Editor → New query →
+-- cole TODO este arquivo → Run. Depois crie a conta admin pelo app
+-- e promova com: update public.profiles set role='admin' where username='admin';
 -- ============================================================================
 
 -- ============================================================
--- 1. HELPERS
+-- 1. TABELAS (primeiro — nada as referencia ainda)
 -- ============================================================
 
--- Verifica se o usuário logado é administrador (security definer:
--- lê profiles sem depender de RLS)
-create or replace function public.is_admin()
-returns boolean
-language sql stable security definer set search_path = public
-as $$
-  select exists (
-    select 1 from public.profiles
-    where id = auth.uid() and role = 'admin'
-  );
-$$;
-
--- Gera um ID de transação no mesmo formato usado pelo app (TX-XXXX...)
-create or replace function public.gerar_id_tx()
-returns text
-language sql volatile
-as $$
-  select 'TX-' || upper(substr(md5(random()::text || clock_timestamp()::text), 1, 12));
-$$;
-
--- ============================================================
--- 2. TABELAS
--- ============================================================
-
--- PERFIS — 1 para 1 com auth.users (o SUPABASE AUTH guarda o e-mail e o
--- HASH DA SENHA — nunca em texto puro, nunca no frontend)
 create table if not exists public.profiles (
   id uuid primary key references auth.users(id) on delete cascade,
   username text unique not null,
@@ -48,12 +36,11 @@ create table if not exists public.profiles (
   balance bigint not null default 162000,      -- centavos; começa com R$ 1.620,00
   role text not null default 'user',
   blocked boolean not null default false,
-  pix_keys jsonb not null default '[]',
+  pix_keys jsonb not null default '[]'::jsonb,
   last_salary_at timestamptz not null default now(),
   created_at timestamptz not null default now()
 );
 
--- TRANSAÇÕES — extrato de todos os usuários
 create table if not exists public.transactions (
   id text primary key,
   user_id uuid not null references public.profiles(id) on delete cascade,
@@ -72,7 +59,6 @@ create table if not exists public.transactions (
 );
 create index if not exists transactions_user_idx on public.transactions (user_id, created_at desc);
 
--- COBRANÇAS (taxas/impostos do bairro)
 create table if not exists public.fees (
   id text primary key,
   description text not null,
@@ -85,7 +71,6 @@ create table if not exists public.fees (
   created_at timestamptz not null default now()
 );
 
--- BOLETOS FICTÍCIOS
 create table if not exists public.boletos (
   code text primary key,
   beneficiary text not null,
@@ -96,7 +81,28 @@ create table if not exists public.boletos (
 );
 
 -- ============================================================
--- 3. ROW LEVEL SECURITY (RLS)
+-- 2. HELPERS (agora as tabelas já existem)
+-- ============================================================
+
+create or replace function public.is_admin()
+returns boolean
+language sql stable security definer set search_path = public
+as $$
+  select exists (
+    select 1 from public.profiles
+    where id = auth.uid() and role = 'admin'
+  );
+$$;
+
+create or replace function public.gerar_id_tx()
+returns text
+language sql volatile
+as $$
+  select 'TX-' || upper(substr(md5(random()::text || clock_timestamp()::text), 1, 12));
+$$;
+
+-- ============================================================
+-- 3. ROW LEVEL SECURITY
 -- ============================================================
 
 alter table public.profiles     enable row level security;
@@ -104,44 +110,46 @@ alter table public.transactions enable row level security;
 alter table public.fees         enable row level security;
 alter table public.boletos      enable row level security;
 
--- PERFIS: usuário vê/edita os próprios dados; admin vê/edita todos
+drop policy if exists "profiles_select" on public.profiles;
 create policy "profiles_select" on public.profiles
   for select to authenticated
   using (id = auth.uid() or public.is_admin());
 
+drop policy if exists "profiles_update" on public.profiles;
 create policy "profiles_update" on public.profiles
   for update to authenticated
   using (id = auth.uid() or public.is_admin());
 
--- TRANSAÇÕES: usuário vê apenas as próprias; admin vê todas.
--- (Inserção financeira do usuário comum acontece SOMENTE pelas funções
--- RPC security definer abaixo — nunca direto no cliente.)
+drop policy if exists "transactions_select" on public.transactions;
 create policy "transactions_select" on public.transactions
   for select to authenticated
   using (user_id = auth.uid() or public.is_admin());
 
+drop policy if exists "transactions_insert_admin" on public.transactions;
 create policy "transactions_insert_admin" on public.transactions
   for insert to authenticated
   with check (public.is_admin());
 
--- COBRANÇAS: todos autenticados leem; só admin cria/edita/cancela
+drop policy if exists "fees_select" on public.fees;
 create policy "fees_select" on public.fees
   for select to authenticated using (true);
 
+drop policy if exists "fees_write_admin" on public.fees;
 create policy "fees_write_admin" on public.fees
   for all to authenticated
   using (public.is_admin()) with check (public.is_admin());
 
--- BOLETOS: todos autenticados leem; só admin edita (pagamento é via RPC)
+drop policy if exists "boletos_select" on public.boletos;
 create policy "boletos_select" on public.boletos
   for select to authenticated using (true);
 
+drop policy if exists "boletos_write_admin" on public.boletos;
 create policy "boletos_write_admin" on public.boletos
   for all to authenticated
   using (public.is_admin()) with check (public.is_admin());
 
 -- ============================================================
--- 4. CRIAÇÃO AUTOMÁTICA DE PERFIL NO CADASTRO
+-- 4. GATILHO DE CADASTRO (CORRIGIDO — sem operador inválido)
 -- ============================================================
 
 create or replace function public.handle_new_user()
@@ -150,24 +158,56 @@ language plpgsql security definer set search_path = public
 as $$
 declare
   v_telefone text := '+55' || regexp_replace(coalesce(new.raw_user_meta_data->>'telefone', ''), '\D', '', 'g');
+  v_chaves jsonb;
 begin
+  -- Cadastros anônimos (sem username) não criam perfil — evita erro 500
+  if coalesce(new.raw_user_meta_data->>'username', '') = '' then
+    return new;
+  end if;
+
+  -- Se o perfil já existe (re-execução), não duplica
+  if exists (select 1 from public.profiles where id = new.id) then
+    return new;
+  end if;
+
+  -- Monta o array de chaves Pix com concatenação jsonb (||) — suportado
+  v_chaves := jsonb_build_array(
+    jsonb_build_object(
+      'value', lower(new.email),
+      'type', 'email',
+      'label', 'E-mail (cadastro)',
+      'createdAt', (extract(epoch from now()) * 1000)::bigint
+    )
+  );
+  if length(regexp_replace(v_telefone, '\D', '', 'g')) >= 10 then
+    v_chaves := v_chaves || jsonb_build_array(
+      jsonb_build_object(
+        'value', v_telefone,
+        'type', 'telefone',
+        'label', 'Telefone (cadastro)',
+        'createdAt', (extract(epoch from now()) * 1000)::bigint
+      )
+    );
+  end if;
+
   insert into public.profiles (id, username, nome_completo, telefone, data_nascimento, endereco, bairro, pix_keys)
   values (
     new.id,
     new.raw_user_meta_data->>'username',
-    new.raw_user_meta_data->>'nome_completo',
+    coalesce(new.raw_user_meta_data->>'nome_completo', new.raw_user_meta_data->>'username'),
     v_telefone,
     nullif(new.raw_user_meta_data->>'data_nascimento', '')::date,
     coalesce(new.raw_user_meta_data->>'endereco', ''),
     coalesce(new.raw_user_meta_data->>'bairro', ''),
-    jsonb_build_array(
-      jsonb_build_object('value', lower(new.email), 'type', 'email', 'label', 'E-mail (cadastro)', 'createdAt', extract(epoch from now())*1000),
-      case when length(regexp_replace(v_telefone, '\D', '', 'g')) >= 10
-        then jsonb_build_object('value', v_telefone, 'type', 'telefone', 'label', 'Telefone (cadastro)', 'createdAt', extract(epoch from now())*1000)
-        else null end
-    ) - 'null'::jsonb
+    v_chaves
   );
   return new;
+exception
+  when others then
+    -- Nunca derruba o cadastro do Auth por problema no perfil:
+    -- o app avisa o usuário e ele pode tentar outro username.
+    raise warning 'handle_new_user: %', sqlerrm;
+    return new;
 end $$;
 
 drop trigger if exists on_auth_user_created on auth.users;
@@ -175,13 +215,17 @@ create trigger on_auth_user_created
   after insert on auth.users
   for each row execute procedure public.handle_new_user();
 
--- Proteções no perfil: usuário comum não pode alterar saldo, role ou blocked
--- direto pelo console do navegador (só admin ou funções RPC)
+-- Proteção: usuário comum não altera saldo/role/blocked direto pelo console.
+-- As funções financeiras internas (RPC) marcam a transação com o GUC
+-- 'app.financial_op' — nesse caso a atualização de saldo é legítima.
 create or replace function public.protect_profile()
 returns trigger
 language plpgsql security definer set search_path = public
 as $$
 begin
+  if coalesce(current_setting('app.financial_op', true), '') = '1' then
+    return new; -- veio de função interna segura (RPC financeira)
+  end if;
   if (new.balance <> old.balance or new.role <> old.role or new.blocked <> old.blocked)
      and not public.is_admin() then
     raise exception 'Operação não permitida: saldo, papel e bloqueio só mudam via sistema ou admin.';
@@ -195,10 +239,10 @@ create trigger protect_profile_trigger
   for each row execute procedure public.protect_profile();
 
 -- ============================================================
--- 5. FUNÇÕES FINANCEIRAS (RPC — atômicas, rodam no servidor)
+-- 5. FUNÇÕES FINANCEIRAS (RPC — atômicas, no servidor)
 -- ============================================================
 
--- 5.1) SALÁRIO SEMANAL: credita R$ 1.620,00 por semana decorrida
+-- 5.1) SALÁRIO SEMANAL: R$ 1.620,00 por semana decorrida (retroativo)
 create or replace function public.creditar_salario()
 returns bigint
 language plpgsql security definer set search_path = public
@@ -210,7 +254,9 @@ declare
   v_tx text := public.gerar_id_tx();
 begin
   if auth.uid() is null then raise exception 'Não autenticado.'; end if;
+  perform set_config('app.financial_op', '1', true);
   select * into v_me from public.profiles where id = auth.uid();
+  if not found then raise exception 'Perfil não encontrado.'; end if;
   if v_me.blocked then raise exception 'Sua conta está bloqueada.'; end if;
 
   v_weeks := floor(extract(epoch from (now() - v_me.last_salary_at)) / (7 * 86400));
@@ -233,7 +279,7 @@ begin
   return v_total;
 end $$;
 
--- 5.2) DÍZIMO (e futuros débitos simples do próprio usuário)
+-- 5.2) DÍZIMO
 create or replace function public.registrar_dizimo(p_valor bigint, p_descricao text)
 returns jsonb
 language plpgsql security definer set search_path = public
@@ -243,7 +289,9 @@ declare
   v_tx text := public.gerar_id_tx();
 begin
   if auth.uid() is null then raise exception 'Não autenticado.'; end if;
+  perform set_config('app.financial_op', '1', true);
   select * into v_me from public.profiles where id = auth.uid();
+  if not found then raise exception 'Perfil não encontrado.'; end if;
   if v_me.blocked then raise exception 'Sua conta está bloqueada.'; end if;
   if p_valor is null or p_valor <= 0 then raise exception 'Informe um valor maior que zero.'; end if;
   if p_valor > v_me.balance then raise exception 'Saldo insuficiente para esta contribuição.'; end if;
@@ -255,7 +303,7 @@ begin
   return to_jsonb(t) from public.transactions t where t.id = v_tx;
 end $$;
 
--- 5.3) PIX VIRTUAL: resolve a chave, debita e credita — atômico
+-- 5.3) PIX VIRTUAL: resolve chave, debita e credita — atômico
 create or replace function public.enviar_pix(p_chave text, p_valor bigint, p_descricao text)
 returns jsonb
 language plpgsql security definer set search_path = public
@@ -264,27 +312,29 @@ declare
   v_me public.profiles;
   v_dest public.profiles;
   v_tx text := public.gerar_id_tx();
-  v_digitos text := regexp_replace(p_chave, '\D', '', 'g');
+  v_digitos text := regexp_replace(coalesce(p_chave,''), '\D', '', 'g');
 begin
   if auth.uid() is null then raise exception 'Não autenticado.'; end if;
+  perform set_config('app.financial_op', '1', true);
   select * into v_me from public.profiles where id = auth.uid();
+  if not found then raise exception 'Perfil não encontrado.'; end if;
   if v_me.blocked then raise exception 'Sua conta está bloqueada.'; end if;
   if p_valor is null or p_valor <= 0 then raise exception 'Informe um valor maior que zero.'; end if;
 
-  -- 1) procura pela chave exata (e-mail, telefone, CPF, aleatória)
+  -- 1) chave exata (e-mail, telefone, CPF, aleatória) ou telefone parcial
   select * into v_dest from public.profiles p
   where exists (
     select 1 from jsonb_array_elements(p.pix_keys) k
-    where lower(k->>'value') = lower(trim(p_chave))
+    where lower(k->>'value') = lower(trim(coalesce(p_chave,'')))
        or (k->>'type' = 'telefone' and length(v_digitos) >= 10
            and regexp_replace(k->>'value', '\D', '', 'g') like '%' || v_digitos)
   )
   limit 1;
 
-  -- 2) formato legado usuario@nsconceicao
+  -- 2) formato legado usuario@nsconceicao(.hab)
   if v_dest.id is null then
     select * into v_dest from public.profiles
-    where lower(username) = lower(regexp_replace(trim(p_chave), '@nsconceicao(\.hab)?$', ''))
+    where lower(username) = lower(regexp_replace(trim(coalesce(p_chave,'')), '@nsconceicao(\.hab)?$', ''))
     limit 1;
   end if;
 
@@ -296,32 +346,32 @@ begin
   update public.profiles set balance = balance + p_valor where id = v_dest.id;
 
   insert into public.transactions (id, user_id, type, category, description, amount, direction, balance_after, sender_name, receiver_name, pix_key)
-  values (v_tx, v_me.id, 'pix_enviado', 'pix', 'Pix enviado para ' || v_dest.nome_completo, p_valor, 'out', v_me.balance - p_valor, v_me.nome_completo, v_dest.nome_completo, trim(p_chave));
+  values (v_tx, v_me.id, 'pix_enviado', 'pix', 'Pix enviado para ' || v_dest.nome_completo, p_valor, 'out', v_me.balance - p_valor, v_me.nome_completo, v_dest.nome_completo, trim(coalesce(p_chave,'')));
 
   insert into public.transactions (id, user_id, type, category, description, amount, direction, balance_after, sender_name, receiver_name, pix_key)
-  values (public.gerar_id_tx(), v_dest.id, 'pix_recebido', 'pix', 'Pix recebido de ' || v_me.nome_completo, p_valor, 'in', v_dest.balance + p_valor, v_me.nome_completo, v_dest.nome_completo, trim(p_chave));
+  values (public.gerar_id_tx(), v_dest.id, 'pix_recebido', 'pix', 'Pix recebido de ' || v_me.nome_completo, p_valor, 'in', v_dest.balance + p_valor, v_me.nome_completo, v_dest.nome_completo, trim(coalesce(p_chave,'')));
 
   return to_jsonb(t) from public.transactions t where t.id = v_tx;
 end $$;
 
--- 5.4) RESOLVER CHAVE PIX (apenas para exibir o nome na confirmação)
+-- 5.4) RESOLVER CHAVE PIX (exibe o nome na confirmação)
 create or replace function public.resolver_pix(p_chave text)
 returns table (id uuid, nome_completo text, username text)
 language plpgsql security definer set search_path = public
 as $$
 declare
-  v_digitos text := regexp_replace(p_chave, '\D', '', 'g');
+  v_digitos text := regexp_replace(coalesce(p_chave,''), '\D', '', 'g');
 begin
   return query
   select p.id, p.nome_completo, p.username
   from public.profiles p
   where exists (
     select 1 from jsonb_array_elements(p.pix_keys) k
-    where lower(k->>'value') = lower(trim(p_chave))
+    where lower(k->>'value') = lower(trim(coalesce(p_chave,'')))
        or (k->>'type' = 'telefone' and length(v_digitos) >= 10
            and regexp_replace(k->>'value', '\D', '', 'g') like '%' || v_digitos)
   )
-  or lower(p.username) = lower(regexp_replace(trim(p_chave), '@nsconceicao(\.hab)?$', ''))
+  or lower(p.username) = lower(regexp_replace(trim(coalesce(p_chave,'')), '@nsconceicao(\.hab)?$', ''))
   limit 1;
 end $$;
 
@@ -332,11 +382,12 @@ language plpgsql security definer set search_path = public
 as $$
 declare
   v_me public.profiles;
-  v_valor text := trim(p_valor);
+  v_valor text := trim(coalesce(p_valor,''));
   v_norm text;
 begin
   if auth.uid() is null then raise exception 'Não autenticado.'; end if;
   select * into v_me from public.profiles where id = auth.uid();
+  if not found then raise exception 'Perfil não encontrado.'; end if;
 
   if p_tipo = 'email' then
     v_norm := lower(v_valor);
@@ -355,7 +406,6 @@ begin
     if v_norm !~ '^[a-z0-9._-]{3,40}$' then raise exception 'Chave aleatória: use 3–40 caracteres (letras, números, . _ -).'; end if;
   end if;
 
-  -- unicidade global
   if exists (
     select 1 from public.profiles p
     where exists (select 1 from jsonb_array_elements(p.pix_keys) k where lower(k->>'value') = v_norm)
@@ -370,7 +420,7 @@ begin
   set pix_keys = pix_keys || jsonb_build_array(jsonb_build_object(
     'value', v_norm, 'type', p_tipo,
     'label', case p_tipo when 'email' then 'E-mail' when 'telefone' then 'Telefone' when 'cpf' then 'CPF' else 'Chave aleatória' end,
-    'createdAt', extract(epoch from now())*1000
+    'createdAt', (extract(epoch from now()) * 1000)::bigint
   ))
   where id = v_me.id;
 
@@ -388,10 +438,12 @@ declare
   v_tx text := public.gerar_id_tx();
 begin
   if auth.uid() is null then raise exception 'Não autenticado.'; end if;
+  perform set_config('app.financial_op', '1', true);
   select * into v_me from public.profiles where id = auth.uid();
+  if not found then raise exception 'Perfil não encontrado.'; end if;
   if v_me.blocked then raise exception 'Sua conta está bloqueada.'; end if;
 
-  select * into v_b from public.boletos where code = trim(p_codigo);
+  select * into v_b from public.boletos where code = trim(coalesce(p_codigo,''));
   if not found then raise exception 'Boleto não encontrado. Verifique o código digitado.'; end if;
   if v_b.status = 'pago' then raise exception 'Este boleto já foi pago.'; end if;
   if v_b.amount > v_me.balance then raise exception 'Saldo insuficiente para esta operação.'; end if;
@@ -416,10 +468,12 @@ declare
   v_tx text := public.gerar_id_tx();
 begin
   if auth.uid() is null then raise exception 'Não autenticado.'; end if;
+  perform set_config('app.financial_op', '1', true);
   select * into v_me from public.profiles where id = auth.uid();
+  if not found then raise exception 'Perfil não encontrado.'; end if;
   if v_me.blocked then raise exception 'Sua conta está bloqueada.'; end if;
 
-  select * into v_f from public.fees where id = trim(p_fee_id) for update;
+  select * into v_f from public.fees where id = trim(coalesce(p_fee_id,'')) for update;
   if not found then raise exception 'Cobrança não encontrada.'; end if;
   if v_f.status <> 'pendente' then raise exception 'Esta cobrança não está mais em aberto.'; end if;
   if v_f.amount > v_me.balance then raise exception 'Saldo insuficiente para esta operação.'; end if;
@@ -438,7 +492,7 @@ create or replace function public.username_existe(p_username text)
 returns boolean
 language sql stable security definer set search_path = public
 as $$
-  select exists (select 1 from public.profiles where lower(username) = lower(trim(p_username)));
+  select exists (select 1 from public.profiles where lower(username) = lower(trim(coalesce(p_username,''))));
 $$;
 
 create or replace function public.email_de_username(p_username text)
@@ -447,7 +501,7 @@ language sql stable security definer set search_path = public
 as $$
   select u.email from auth.users u
   join public.profiles p on p.id = u.id
-  where lower(p.username) = lower(trim(p_username))
+  where lower(p.username) = lower(trim(coalesce(p_username,'')))
   limit 1;
 $$;
 
@@ -471,10 +525,6 @@ insert into public.fees (id, description, amount, due_date, bairro) values
 on conflict (id) do nothing;
 
 -- ============================================================
--- 7. TORNAR-SE ADMINISTRADOR
--- ============================================================
--- 1) Crie uma conta normalmente pelo app (ex.: admin@paroquia.com).
--- 2) Depois execute no SQL Editor (troque o e-mail):
+-- 7. TORNAR-SE ADMINISTRADOR (após criar a conta pelo app):
 --    update public.profiles set role = 'admin' where username = 'admin';
---    (ou: ... where id = (select id from auth.users where email = 'admin@paroquia.com'))
 -- ============================================================
